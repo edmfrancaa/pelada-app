@@ -54,13 +54,20 @@ def _expand_in(ids, param_prefix="p"):
     return placeholders, params
 
 def normalize_season(v) -> str:
-    if v is None: return None
+    """
+    Normaliza temporada aceitando apenas anos com 4 dígitos (ex.: '2025').
+    Se não houver 4 dígitos, retorna None.
+    """
+    if v is None:
+        return None
     s = re.sub(r"[.,]", "", str(v))
     d = re.findall(r"\d+", s)
-    if not d: return None
+    if not d:
+        return None
     n = "".join(d)
-    if len(n) >= 4: n = n[:4]
-    return n
+    if len(n) < 4:
+        return None
+    return n[:4]
 
 def parse_br_date(s: str):
     s = str(s).strip()
@@ -259,10 +266,10 @@ def upsert_player_round_for_date(pid: int, d_iso: str):
 # -------------- Import helpers ---------------
 def import_players_df(df: pd.DataFrame):
     """
-    Importa jogadores garantindo consistência:
-    - Posição "GOL" => role='GOLEIRO', is_goalkeeper=1
-    - Demais posições => role='JOGADOR', is_goalkeeper=0
-    Aceita cabeçalhos: "Nome do Jogador", "Posição do Jogador", "Plano", "Tabela", "Apelido" (opcional)
+    Importa jogadores garantindo:
+    - Se 'Apelido' vier vazio, usamos 'Nome' como nickname.
+    - Posição 'GOL' => role='GOLEIRO', is_goalkeeper=1; demais => 'JOGADOR', 0.
+    Cabeçalhos aceitos: Nome do Jogador, Posição do Jogador, Plano, Tabela, Apelido (opcional)
     """
     # Mapeamento de colunas (aceitando variações)
     cmap = {}
@@ -286,6 +293,9 @@ def import_players_df(df: pd.DataFrame):
         if not name:
             continue
 
+        raw_nk = str(r.get("nickname") or "").strip()
+        nk = raw_nk if raw_nk else name  # força nickname = name quando não vier apelido
+
         pos = str(r.get("position","ATA")).strip().upper()
         is_gk = 1 if pos == "GOL" else 0
         role = "GOLEIRO" if is_gk else "JOGADOR"
@@ -296,14 +306,12 @@ def import_players_df(df: pd.DataFrame):
             "VALUES(:n,:nk,:pos,:role,:gk,:plan,1) "
             "ON CONFLICT(name) DO UPDATE SET nickname=:nk, position=:pos, role=:role, "
             "is_goalkeeper=:gk, plan=:plan, active=1",
-            {"n":name,
-             "nk":str(r.get("nickname") or "").strip(),
-             "pos":pos,
-             "role":role,
-             "gk":is_gk,
-             "plan":plan},
+            {"n": name, "nk": nk, "pos": pos, "role": role, "gk": is_gk, "plan": plan},
         )
         ok += 1
+
+    # Pós-ajuste idempotente: garante que todos tenham apelido
+    exec_sql("UPDATE players SET nickname = name WHERE nickname IS NULL OR TRIM(nickname) = ''")
     return {"linhas": total, "gravadas": ok}
 
 def import_player_links(df: pd.DataFrame):
@@ -783,7 +791,17 @@ def _month_name_pt(m):  # 1..12
     return BR_MONTHS.get(m, f"M{m}")
 
 def _month_bounds(yy, mm:int):
-    y = int(yy)
+    """
+    Retorna limites do mês garantindo ano válido.
+    Se o ano não for válido (ex.: 0, None, texto), cai no ano atual.
+    Também restringe a faixa a 1900..2100 por segurança.
+    """
+    try:
+        y = int(yy)
+    except Exception:
+        y = date.today().year
+    if y < 1900 or y > 2100:
+        y = date.today().year
     start = date(y, mm, 1)
     last = calendar.monthrange(y, mm)[1]
     end = date(y, mm, last)
@@ -846,13 +864,13 @@ def _matrix_to_flags(season:str, edited_df:pd.DataFrame):
     return saved
 
 def _rounds_count_in_month(season:str, month:int):
-    y = int(season)
+    y = normalize_season(season) or str(date.today().year)
     d1, d2 = _month_bounds(y, month)
     df = df_query("SELECT COUNT(*) AS n FROM rounds WHERE date BETWEEN :a AND :b", {"a": d1, "b": d2})
     return int(df.iloc[0]["n"]) if not df.empty else 0
 
 def _avulso_presencas_in_month(season:str, month:int):
-    y = int(season)
+    y = normalize_season(season) or str(date.today().year)
     d1, d2 = _month_bounds(y, month)
     df = df_query("""
       SELECT COUNT(*) AS n
@@ -865,6 +883,7 @@ def _avulso_presencas_in_month(season:str, month:int):
     """, {"a": d1, "b": d2})
     return int(df.iloc[0]["n"]) if not df.empty else 0
 
+
 def _mensalistas_paid_count(season:str, month:int):
     df = df_query("""
       SELECT COUNT(*) AS n
@@ -876,7 +895,7 @@ def _mensalistas_paid_count(season:str, month:int):
     return int(df.iloc[0]["n"]) if not df.empty else 0
 
 def _cards_counts_in_month(season:str, month:int):
-    y = int(season)
+    y = normalize_season(season) or str(date.today().year)
     d1, d2 = _month_bounds(y, month)
     df = df_query("""
       SELECT
@@ -890,17 +909,19 @@ def _cards_counts_in_month(season:str, month:int):
         return 0, 0
     return int(df.iloc[0]["ca"] or 0), int(df.iloc[0]["cv"] or 0)
 
+
 def _cash_extra_month(season:str, month:int):
-    y = int(season)
+    y = normalize_season(season) or str(date.today().year)
     d1, d2 = _month_bounds(y, month)
     df = df_query("""
       SELECT COALESCE(type,'') AS type, COALESCE(value,0) AS value
         FROM cash_extra
        WHERE season=:s AND date BETWEEN :a AND :b
-    """, {"s": season, "a": d1, "b": d2})
+    """, {"s": normalize_season(season) or str(date.today().year), "a": d1, "b": d2})
     entradas = float(df[df["type"]=="Entrada"]["value"].sum()) if not df.empty else 0.0
     saidas   = float(df[df["type"]=="Saída"]["value"].sum()) if not df.empty else 0.0
     return entradas, saidas
+
 
 def _month_summary(season:str, month:int):
     monthly_fee = float(get_setting("monthly_fee","0") or 0)
@@ -1001,9 +1022,11 @@ with tabs[1]:
 
     active = st.checkbox("Ativo?", value=True, key="add_active")
 
+    # Botão de salvar DENTRO da aba
     if st.button("Salvar jogador", key="add_save_btn"):
         try:
             role = "GOLEIRO" if pos == "GOL" else "JOGADOR"
+            nk_final = nickname.strip() if nickname.strip() else name.strip()  # se apelido vazio, usa nome
             exec_sql(
                 "INSERT INTO players(name, nickname, position, role, is_goalkeeper, plan, active) "
                 "VALUES(:n,:nk,:pos,:role,:gk,:plan,:act) "
@@ -1011,7 +1034,7 @@ with tabs[1]:
                 "is_goalkeeper=:gk, plan=:plan, active=:act",
                 {
                     "n": name.strip(),
-                    "nk": nickname.strip(),
+                    "nk": nk_final,
                     "pos": pos,
                     "role": role,
                     "gk": 1 if role == "GOLEIRO" else 0,
@@ -1019,45 +1042,66 @@ with tabs[1]:
                     "act": 1 if active else 0,
                 },
             )
+            exec_sql("UPDATE players SET nickname = name WHERE nickname IS NULL OR TRIM(nickname) = ''")
             st.success("Jogador salvo!")
         except Exception as e:
             st.error(f"Erro ao salvar: {e}")
 
-    st.markdown("### Importar jogadores (CSV/XLSX)")
-    st.caption("Cabeçalhos: **Nome do Jogador; Posição do Jogador; Plano; Tabela** (Tabela pode vir vazia; inferimos pela posição).")
+    # 📥 Importação de jogadores — visível SOMENTE nesta aba
+    st.divider()
+    st.markdown("### 📥 Importar jogadores (CSV/Excel)")
 
     players_tpl = pd.DataFrame({
-        "Nome do Jogador":["Fulano","Beltrano"],
-        "Posição do Jogador":["ATA","GOL"],
-        "Plano":["Mensalista","Avulso"],
-        "Tabela":["Jogadores","Goleiros"],
+        "Nome do Jogador": ["Fulano da Silva", "Beltrano Souza"],
+        "Apelido": ["Fulano", "Bel"],
+        "Posição do Jogador": ["ATA", "GOL"],
+        "Plano": ["Mensalista", "Avulso"],
+        "Tabela": ["Jogadores", "Goleiros"]
     })
-    st.download_button("⬇️ Modelo CSV (jogadores)", data=players_tpl.to_csv(index=False).encode("utf-8"),
-                       file_name="modelo_jogadores.csv", mime="text/csv", key="tpl_players_csv")
-    st.download_button("⬇️ Modelo Excel (jogadores)", data=to_xlsx_bytes(players_tpl, "Jogadores"),
-                       file_name="modelo_jogadores.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       key="tpl_players_xlsx")
 
-    upj = st.file_uploader("Upload CSV/XLSX de jogadores", type=["csv","xlsx","xls"], key="up_players")
-    if upj is not None:
+    c_tpl1, c_tpl2 = st.columns(2)
+    with c_tpl1:
+        st.download_button(
+            "⬇️ Modelo CSV (jogadores)",
+            data=players_tpl.to_csv(index=False).encode("utf-8"),
+            file_name="modelo_jogadores.csv",
+            mime="text/csv",
+            key="tpl_players_csv"
+        )
+    with c_tpl2:
+        st.download_button(
+            "⬇️ Modelo Excel (jogadores)",
+            data=to_xlsx_bytes(players_tpl, "Jogadores"),
+            file_name="modelo_jogadores.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="tpl_players_xlsx"
+        )
+
+    up_players = st.file_uploader(
+        "Upload CSV/XLSX de jogadores", type=["csv", "xlsx", "xls"], key="players_import_uploader"
+    )
+
+    if up_players is not None:
         try:
-            df = pd.read_excel(upj) if upj.name.lower().endswith((".xlsx",".xls")) else pd.read_csv(upj)
-            res = import_players_df(df)
-            st.success(f"Importado: {res['gravadas']} de {res['linhas']} linhas.")
+            dfimp = (
+                pd.read_excel(up_players)
+                if up_players.name.lower().endswith((".xlsx", ".xls"))
+                else pd.read_csv(up_players)
+            )
+            res = import_players_df(dfimp)
+            st.success(
+                f"Importação concluída. Linhas lidas: {res.get('linhas', 0)} · "
+                f"Gravadas/atualizadas: {res.get('gravadas', 0)}"
+            )
         except Exception as e:
-            st.error(f"Erro ao importar: {e}")
-
-    st.markdown("### Lista de jogadores")
-    players = df_query("SELECT id, COALESCE(nickname,name) AS Nome, position AS Posição, role AS Tipo, plan AS Plano, active AS Ativo FROM players ORDER BY Nome")
-    st.dataframe(players, use_container_width=True, hide_index=True, key="players_list")
+            st.error(f"Erro ao importar jogadores: {e}")
 
 # ---- Presença/Sorteio ----
 with tabs[2]:
     st.subheader("Presença & Sorteio")
 
-    # Data/temporada
-    c1, c2 = st.columns([1,1])
+    # Data/Temporada
+    c1, c2 = st.columns([1, 1])
     rdate = c1.date_input("Data da rodada", value=date.today(), key="draw_date")
     season_in = c2.text_input("Temporada (ex.: 2025)", value=str(date.today().year), key="draw_season")
     season_norm = normalize_season(season_in) or str(date.today().year)
@@ -1077,44 +1121,43 @@ with tabs[2]:
         # Mapa id->nome
         id2name = {int(r.player_id): str(r.nome) for r in jdf.itertuples(index=False)}
 
-        # Seleção com busca (multiselect) — lista de selecionados ACIMA
+        # Seleção — igual ao multiselect de Cartões (form + Atualizar seleção)
         st.markdown("#### Selecionados para a rodada")
-        if "presence_selected" not in st.session_state:
-            st.session_state["presence_selected"] = []
 
-        if st.session_state["presence_selected"]:
-            st.write(", ".join(id2name.get(i, f"#{i}") for i in st.session_state["presence_selected"]))
+        sel_key = "presence_selected"
+        if sel_key not in st.session_state:
+            st.session_state[sel_key] = []
+
+        # Multiselect com busca embutida; usa botão para gravar no estado (igual Cartões)
+        with st.form("presence_select_form", clear_on_submit=False):
+            sel_players_tmp = st.multiselect(
+                "Jogadores",
+                options=jdf["player_id"].astype(int).tolist(),
+                format_func=lambda i: id2name.get(int(i), f"#{i}"),
+                default=st.session_state[sel_key],
+                key="presence_multiselect",
+                placeholder="Digite o nome/apelido e tecle Enter"
+            )
+            ok_presence = st.form_submit_button("Atualizar seleção")
+            if ok_presence:
+                st.session_state[sel_key] = list(sel_players_tmp)
+
+        # Resumo (quantidade + nomes)
+        selected_ids = st.session_state[sel_key]
+        if selected_ids:
+            nomes = [id2name.get(int(i), f"#{i}") for i in selected_ids]
+            st.caption(f"**{len(selected_ids)} selecionado(s):** " + ", ".join(nomes))
         else:
             st.caption("_Nenhum jogador selecionado ainda._")
 
-        sel = st.multiselect(
-            "Pesquisar jogadores e teclar Enter para adicionar",
-            options=jdf["player_id"].tolist(),
-            format_func=lambda i: id2name.get(int(i), f"#{i}"),
-            default=st.session_state["presence_selected"],
-            key="presence_selector",
-            placeholder="Digite nome/apelido…"
-        )
-        st.session_state["presence_selected"] = list(sel)
-
-        # Ações rápidas
-        bc1, bc2 = st.columns(2)
-        if bc1.button("Limpar seleção"):
-            st.session_state["presence_selected"] = []
-            st.rerun()
-        if bc2.button("Selecionar todos"):
-            st.session_state["presence_selected"] = jdf["player_id"].astype(int).tolist()
-            st.rerun()
-
-        # Sorteio
-        colA, colB, colC = st.columns(3)
-        if colA.button("🎲 Sortear Times", key="btn_sortear"):
-            chosen = jdf[jdf["player_id"].isin(st.session_state["presence_selected"])]
+        # Sorteio (gera prévia em sessão; não grava no banco)
+        if st.button("🎲 Sortear Times", key="btn_sortear"):
+            chosen = jdf[jdf["player_id"].isin(selected_ids)]
             if chosen.empty:
                 st.warning("Selecione pelo menos 1 jogador.")
             else:
-                line_ids = chosen[chosen["gk"]==0]["player_id"].astype(int).tolist()
-                gk_ids   = chosen[chosen["gk"]==1]["player_id"].astype(int).tolist()
+                line_ids = chosen[chosen["gk"] == 0]["player_id"].astype(int).tolist()
+                gk_ids   = chosen[chosen["gk"] == 1]["player_id"].astype(int).tolist()
 
                 random.shuffle(line_ids)
                 random.shuffle(gk_ids)
@@ -1122,15 +1165,16 @@ with tabs[2]:
                 per_team = int(get_setting("players_per_team_line", "5") or 5)
                 n_teams = max(1, math.ceil(len(line_ids) / per_team))
 
-                teams = {i+1: [] for i in range(n_teams)}
+                teams = {i + 1: [] for i in range(n_teams)}
 
-                # distribuir linha
+                # distribuir jogadores de linha
                 for i, pid in enumerate(line_ids):
                     t = (i // per_team) + 1
-                    if t > n_teams: t = n_teams
+                    if t > n_teams:
+                        t = n_teams
                     teams[t].append(pid)
 
-                # 1 GK por time; excedentes ficam sem time
+                # 1 goleiro por time; excedentes ficam sem time
                 team_has_gk = {k: False for k in teams.keys()}
                 unassigned_gk = []
                 for i, gid in enumerate(gk_ids):
@@ -1145,13 +1189,14 @@ with tabs[2]:
                     "date": rdate.isoformat(),
                     "season": season_norm,
                     "teams": teams,
+                    "selected": list(map(int, selected_ids)),  # <- novo: guarda os selecionados
                     "unassigned_gk": unassigned_gk
                 }
                 st.success("Times sorteados! Veja a prévia abaixo.")
 
-        # Prévia com N O M E S / A P E L I D O S
+        # Prévia (exibe sempre que existir no estado)
         dr = st.session_state.get("draw_preview")
-        if dr and dr.get("date")==rdate.isoformat():
+        if dr and dr.get("date") == rdate.isoformat():
             st.markdown("### Prévia do sorteio")
             cols = st.columns(len(dr["teams"]))
             for idx, (tno, ids) in enumerate(sorted(dr["teams"].items())):
@@ -1161,51 +1206,83 @@ with tabs[2]:
                         st.write("- (vazio)")
                     else:
                         for pid in ids:
-                            is_gk = 0
-                            nm = f"#{pid}"
-                            base = jdf[jdf["player_id"]==int(pid)]
-                            if not base.empty:
-                                nm = str(base.iloc[0]["nome"])
-                                is_gk = int(base.iloc[0]["gk"])
-                            st.write(("🧤 " if is_gk==1 else "• ") + nm)
+                            base = jdf[jdf["player_id"] == int(pid)]
+                            nm = str(base.iloc[0]["nome"]) if not base.empty else f"#{pid}"
+                            is_gk = int(base.iloc[0]["gk"]) if not base.empty else 0
+                            st.write(("🧤 " if is_gk == 1 else "• ") + nm)
 
             if dr["unassigned_gk"]:
                 names = [id2name.get(int(x), f"#{x}") for x in dr["unassigned_gk"]]
                 st.warning("Goleiros sem time: " + ", ".join(names))
 
-            if st.button("🛠️ Criar/Abrir rodada com este sorteio", key="btn_criar_sorteio"):
-                d_iso = dr["date"]; season = dr["season"]
-                rid2, _ = get_or_create_round_by_date(d_iso, season=season, four_gk_default=False)
+        # Botão de criar/abrir rodada (fora do if do sorteio)
+        st.divider()
+        if st.button("🧾 Criar/abrir rodada", key="btn_create_round_presence"):
+            # cria/abre a rodada
+            rid, created = get_or_create_round_by_date(
+                rdate.isoformat(),
+                season=season_norm,
+                four_gk_default=False
+            )
+            # garante season atualizada mesmo se já existia
+            exec_sql("UPDATE rounds SET season=:s WHERE id=:r", {"s": season_norm, "r": rid})
 
-                # Limpa times e cria do zero
-                exec_sql("DELETE FROM teams_round WHERE round_id=:r", {"r": rid2})
-                tmap = {}
+            # se houver prévia desta data, persiste vínculos
+            dr = st.session_state.get("draw_preview") or {}
+            if dr.get("date") == rdate.isoformat() and "teams" in dr:
+                # cria/garante times "Time 1..N"
+                team_id_map = {}
                 for tno in sorted(dr["teams"].keys()):
-                    tid = get_or_create_team_round(rid2, f"Time {tno}")
-                    tmap[tno] = tid
+                    team_id_map[tno] = get_or_create_team_round(rid, f"Time {tno}")
 
-                # Vincula jogadores
-                total = 0
-                for tno, ids in dr["teams"].items():
-                    tid = tmap[tno]
+                # vincula cada jogador ao seu time e marca presença=1
+                assigned = set()
+                for tno, ids in sorted(dr["teams"].items()):
+                    tid = int(team_id_map[tno])
                     for pid in ids:
+                        pid = int(pid)
+                        assigned.add(pid)
                         try:
                             exec_sql(
                                 "INSERT INTO player_round(round_id, player_id, presence, team_round_id) "
                                 "VALUES(:r,:p,1,:t)",
-                                {"r": rid2, "p": int(pid), "t": int(tid)}
+                                {"r": rid, "p": pid, "t": tid},
                             )
                         except Exception:
                             exec_sql(
-                                "UPDATE player_round SET team_round_id=:t, presence=1 WHERE round_id=:r AND player_id=:p",
-                                {"r": rid2, "p": int(pid), "t": int(tid)}
+                                "UPDATE player_round SET presence=1, team_round_id=:t "
+                                "WHERE round_id=:r AND player_id=:p",
+                                {"r": rid, "p": pid, "t": tid},
                             )
-                        total += 1
-                recalc_round(rid2)
+
+                # marca presença para selecionados que ficaram sem time (ex.: goleiro excedente)
+                selected_set = set(int(x) for x in (dr.get("selected") or []))
+                leftovers = sorted(list(selected_set - assigned))
+                for pid in leftovers:
+                    try:
+                        exec_sql(
+                            "INSERT INTO player_round(round_id, player_id, presence) VALUES(:r,:p,1)",
+                            {"r": rid, "p": int(pid)}
+                        )
+                    except Exception:
+                        exec_sql(
+                            "UPDATE player_round SET presence=1 WHERE round_id=:r AND player_id=:p",
+                            {"r": rid, "p": int(pid)}
+                        )
+
+                # recalcula e renumera as rodadas
+                recalc_round(rid)
                 generate_round_notes_sequence()
-                st.success(f"Rodada #{rid2} criada/atualizada a partir do sorteio. Jogadores vinculados: {total}.")
-        else:
-            st.info("Faça o sorteio para visualizar a prévia e criar a rodada.")
+
+                st.success(
+                    f"Rodada #{rid} {'criada' if created else 'aberta'} para {rdate.isoformat()} "
+                    f"(temporada {season_norm}) e times/vínculos aplicados."
+                )
+                st.info("Agora, em 📆 Rodadas & Times, os jogadores já aparecem nos respectivos times.")
+            else:
+                st.success(f"Rodada #{rid} {'criada' if created else 'aberta'}.")
+                st.info("Você ainda não sorteou times para esta data — faça o sorteio e clique novamente para vincular os jogadores.")
+
 
 # ---- Rodadas & Times ----
 with tabs[3]:
@@ -1237,12 +1314,7 @@ with tabs[3]:
     # ====== VISÃO GUIADA (Times horizontais + GKs + Cartões) ======
     st.markdown("### Times da Rodada (sorteio) — visão horizontal")
 
-    # Garante 4 times
-    existing = df_query("SELECT id, name, wins, draws FROM teams_round WHERE round_id=:r", {"r": rid})
-    for i in range(1, 5):
-        nm = f"Time {i}"
-        if existing[existing["name"] == nm].empty:
-            get_or_create_team_round(rid, nm)
+    # Usa somente os times realmente existentes na rodada
     teams = df_query(
         "SELECT id, name, wins, draws FROM teams_round WHERE round_id=:r ORDER BY name",
         {"r": rid}
@@ -1258,6 +1330,7 @@ with tabs[3]:
         WHERE pr.round_id=:r AND pr.team_round_id IS NOT NULL
         ORDER BY nome
     """, {"r": rid})
+
 
     cols = st.columns(4)
     save_team_vals = []
@@ -1285,84 +1358,99 @@ with tabs[3]:
         recalc_round(rid)
         st.success("Times atualizados!")
 
-    st.divider()
-    st.markdown("### 🧤 Goleiros — vitórias & empates (individual)")
+    # ===== Seções extras da aba 📆 (agora restritas à aba) =====
 
-    df_g = df_query("""
-        SELECT pr.id, p.id AS player_id, COALESCE(p.nickname,p.name) AS goleiro,
-               COALESCE(pr.wins,0) AS vitorias, COALESCE(pr.draws,0) AS empates
-        FROM player_round pr
-        JOIN players p ON p.id=pr.player_id
-        WHERE pr.round_id=:r AND (p.role='GOLEIRO' OR p.is_goalkeeper=1)
-        ORDER BY goleiro
-    """, {"r": rid})
+    # 1) 🧤 Goleiros — aparecer APENAS se nº de goleiros < nº de times da rodada
+    n_teams = len(teams)
 
-    current_gk = []
-    if not df_g.empty:
-        gcols = st.columns(2)
-        half = (len(df_g) + 1) // 2
-        for idx, row in enumerate(df_g.itertuples(index=False)):
-            col = gcols[0] if idx < half else gcols[1]
-            with col:
-                st.write(f"**{row.goleiro}**")
-                v = st.number_input("Vitórias", min_value=0, step=1, value=int(row.vitorias),
-                                    key=f"gk_v_{rid}_{row.id}")
-                e = st.number_input("Empates", min_value=0, step=1, value=int(row.empates),
-                                    key=f"gk_e_{rid}_{row.id}")
-                current_gk.append((int(row.id), int(v), int(e)))
+    n_gks_round = int(
+        df_query("""
+            SELECT COUNT(*) AS n
+              FROM player_round pr
+              JOIN players p ON p.id=pr.player_id
+             WHERE pr.round_id=:r
+               AND (p.role='GOLEIRO' OR p.is_goalkeeper=1)
+        """, {"r": rid}).iloc[0]["n"] or 0
+    )
 
-        if st.button("💾 Salvar goleiros (existentes)", key=f"save_gk_exist_{rid}"):
-            for pr_id, v, e in current_gk:
-                exec_sql("""UPDATE player_round
-                               SET wins=:w, draws=:d, points=:p, individual_override=1
-                             WHERE id=:id""",
-                         {"w": v, "d": e, "p": calc_points(v, e), "id": pr_id})
-            recalc_round(rid)
-            st.success("Goleiros atualizados!")
+    if n_teams > 0 and n_gks_round < n_teams:
+        st.divider()
+        st.markdown("### 🧤 Goleiros — vitórias & empates (individual)")
 
-    # Adicionar goleiros faltantes
-    current_gk_ids = set(df_g["player_id"].tolist()) if not df_g.empty else set()
-    gk_all = df_query("""
-        SELECT id, COALESCE(nickname,name) AS nome
-        FROM players
-        WHERE active=1 AND (role='GOLEIRO' OR is_goalkeeper=1)
-        ORDER BY nome
-    """)
-    remaining = gk_all[~gk_all["id"].isin(list(current_gk_ids))]
-    if not remaining.empty:
-        st.caption("Adicionar goleiros que não foram lançados nesta rodada:")
-        add_count = min(4 - len(current_gk_ids), len(remaining))
-        for k in range(add_count):
-            c1, c2, c3 = st.columns([2, 1, 1])
-            new_gk = c1.selectbox(
-                f"Goleiro novo {k+1}",
-                options=remaining["id"].tolist(),
-                format_func=lambda i: remaining.loc[remaining["id"] == i, "nome"].iloc[0],
-                key=f"new_gk_sel_{rid}_{k}"
-            )
-            v = c2.number_input("Vitórias", min_value=0, step=1, value=0, key=f"new_gk_v_{rid}_{k}")
-            e = c3.number_input("Empates", min_value=0, step=1, value=0, key=f"new_gk_e_{rid}_{k}")
-            if st.button("➕ Adicionar goleiro", key=f"btn_add_gk_{rid}_{k}"):
-                save_gk_individual(int(rid), int(new_gk), int(v), int(e))
-                recalc_round(int(rid))
-                st.success("Goleiro adicionado. Atualize a seção para ver na lista.")
+        df_g = df_query("""
+            SELECT pr.id, p.id AS player_id, COALESCE(p.nickname,p.name) AS goleiro,
+                   COALESCE(pr.wins,0) AS vitorias, COALESCE(pr.draws,0) AS empates
+            FROM player_round pr
+            JOIN players p ON p.id=pr.player_id
+            WHERE pr.round_id=:r AND (p.role='GOLEIRO' OR p.is_goalkeeper=1)
+            ORDER BY goleiro
+        """, {"r": rid})
 
-    if df_g.shape[0] >= 4:
-        st.info("Há 4 goleiros cadastrados — se cada um estiver em um time, os pontos por time já alimentam as classificações.")
+        current_gk = []
+        if not df_g.empty:
+            gcols = st.columns(2)
+            half = (len(df_g) + 1) // 2
+            for idx, row in enumerate(df_g.itertuples(index=False)):
+                col = gcols[0] if idx < half else gcols[1]
+                with col:
+                    st.write(f"**{row.goleiro}**")
+                    v = st.number_input("Vitórias", min_value=0, step=1, value=int(row.vitorias),
+                                        key=f"gk_v_{rid}_{row.id}")
+                    e = st.number_input("Empates", min_value=0, step=1, value=int(row.empates),
+                                        key=f"gk_e_{rid}_{row.id}")
+                    current_gk.append((int(row.id), int(v), int(e)))
 
+            if st.button("💾 Salvar goleiros (existentes)", key=f"save_gk_exist_{rid}"):
+                for pr_id, v, e in current_gk:
+                    exec_sql("""UPDATE player_round
+                                   SET wins=:w, draws=:d, points=:p, individual_override=1
+                                 WHERE id=:id""",
+                             {"w": v, "d": e, "p": calc_points(v, e), "id": pr_id})
+                recalc_round(rid)
+                st.success("Goleiros atualizados!")
+
+        # Adicionar goleiros faltantes
+        current_gk_ids = set(df_g["player_id"].tolist()) if not df_g.empty else set()
+        gk_all = df_query("""
+            SELECT id, COALESCE(nickname,name) AS nome
+            FROM players
+            WHERE active=1 AND (role='GOLEIRO' OR is_goalkeeper=1)
+            ORDER BY nome
+        """)
+        remaining = gk_all[~gk_all["id"].isin(list(current_gk_ids))]
+        if not remaining.empty:
+            st.caption("Adicionar goleiros que não foram lançados nesta rodada:")
+            add_count = min(len(teams) - len(current_gk_ids), len(remaining)) if len(teams) > len(current_gk_ids) else len(remaining)
+            add_count = max(0, add_count)
+            for k in range(add_count):
+                c1, c2, c3 = st.columns([2, 1, 1])
+                new_gk = c1.selectbox(
+                    f"Goleiro novo {k+1}",
+                    options=remaining["id"].tolist(),
+                    format_func=lambda i: remaining.loc[remaining["id"] == i, "nome"].iloc[0],
+                    key=f"new_gk_sel_{rid}_{k}"
+                )
+                v = c2.number_input("Vitórias", min_value=0, step=1, value=0, key=f"new_gk_v_{rid}_{k}")
+                e = c3.number_input("Empates", min_value=0, step=1, value=0, key=f"new_gk_e_{rid}_{k}")
+                if st.button("➕ Adicionar goleiro", key=f"btn_add_gk_{rid}_{k}"):
+                    save_gk_individual(int(rid), int(new_gk), int(v), int(e))
+                    recalc_round(int(rid))
+                    st.success("Goleiro adicionado. Atualize a seção para ver na lista.")
+
+    # 2) 🟨🟥 Cartões — sempre visível na aba 📆
     st.divider()
     st.markdown("### 🟨🟥 Cartões — seleção e lançamento")
 
     round_players = df_query("""
-        SELECT p.id, COALESCE(p.nickname,p.name) AS nome,
-               COALESCE(pr.yellow_cards,0) AS ca,
-               COALESCE(pr.red_cards,0) AS cv,
-               pr.id AS pr_id
-        FROM player_round pr
-        JOIN players p ON p.id = pr.player_id
-        WHERE pr.round_id=:r
-        ORDER BY nome
-    """, {"r": rid})
+            SELECT p.id, COALESCE(p.nickname,p.name) AS nome,
+                   COALESCE(pr.yellow_cards,0) AS ca,
+                   COALESCE(pr.red_cards,0) AS cv,
+                   pr.id AS pr_id
+            FROM player_round pr
+            JOIN players p ON p.id=pr.player_id
+            WHERE pr.round_id=:r
+            ORDER BY nome
+        """, {"r": rid})
 
     if round_players.empty:
         st.info("Nenhum jogador lançado nesta rodada para registrar cartões.")
@@ -1371,13 +1459,24 @@ with tabs[3]:
         rp_options = round_players["id"].tolist()
         rp_format = {int(r["id"]): str(r["nome"]) for _, r in round_players.iterrows()}
 
-        sel_cards = st.multiselect(
-            "Jogadores",
-            options=rp_options,
-            format_func=lambda i: rp_format.get(int(i), f"#{i}"),
-            key=f"card_sel_{rid}",
-            placeholder="Digite o nome/apelido e tecle Enter"
-        )
+        sel_key = f"card_sel_{rid}"
+        if sel_key not in st.session_state:
+            st.session_state[sel_key] = []
+
+        with st.form(f"card_select_form_{rid}", clear_on_submit=False):
+            sel_cards_tmp = st.multiselect(
+                "Jogadores",
+                options=rp_options,
+                format_func=lambda i: rp_format.get(int(i), f"#{i}"),
+                default=st.session_state[sel_key],
+                key=f"card_selector_{rid}",
+                placeholder="Digite o nome/apelido e tecle Enter"
+            )
+            ok_cards = st.form_submit_button("Atualizar seleção")
+            if ok_cards:
+                st.session_state[sel_key] = list(sel_cards_tmp)
+
+        sel_cards = st.session_state[sel_key]
 
         if not sel_cards:
             st.caption("_Nenhum jogador selecionado para cartões._")
@@ -1397,11 +1496,13 @@ with tabs[3]:
 
             if st.button("💾 Salvar cartões selecionados", key=f"save_cards_sel_{rid}"):
                 for pr_id, ca, cv in edited_vals:
-                    exec_sql("UPDATE player_round SET yellow_cards=:a, red_cards=:v WHERE id=:id",
-                             {"a": ca, "v": cv, "id": pr_id})
+                    exec_sql(
+                        "UPDATE player_round SET yellow_cards=:a, red_cards=:v WHERE id=:id",
+                        {"a": ca, "v": cv, "id": pr_id}
+                    )
                 st.success("Cartões salvos para os jogadores selecionados.")
 
-    # ===== Ferramentas avançadas (modo manual) =====
+    # 3) 🛠️ Ferramentas avançadas (modo manual) — sempre visível na aba 📆
     with st.expander("🛠️ Ferramentas avançadas (modo manual)"):
         st.caption(
             "Ferramentas para **registro manual de equipes**, **importações** e **ajustes**. "
@@ -1455,39 +1556,55 @@ with tabs[3]:
             st.info("Cadastre jogadores e times primeiro.")
         else:
             c1, c2, c3 = st.columns([2, 1, 1])
-            sel_players = c1.multiselect(
-                "Jogadores",
-                options=player_list["id"].tolist(),
-                format_func=lambda i: player_list.loc[player_list["id"]==i, "nome"].iloc[0],
-                key=f"multi_players_{rid}"
-            )
-            team_id = c2.selectbox(
-                "Time",
-                options=team_list["id"].tolist(),
-                format_func=lambda i: team_list.loc[team_list["id"]==i, "name"].iloc[0],
-                key=f"team_sel_{rid}"
-            )
-            mark_presence = c3.checkbox("Marcar presença", value=True, key=f"presence_{rid}")
+
+            sel_key_link = f"multi_players_{rid}"
+            if sel_key_link not in st.session_state:
+                st.session_state[sel_key_link] = []
+
+            with st.form(f"link_select_form_{rid}", clear_on_submit=False):
+                sel_players_tmp = c1.multiselect(
+                    "Jogadores",
+                    options=player_list["id"].tolist(),
+                    format_func=lambda i: player_list.loc[player_list["id"]==i, "nome"].iloc[0],
+                    default=st.session_state[sel_key_link],
+                    key=f"multi_players_selector_{rid}"
+                )
+                team_id = c2.selectbox(
+                    "Time",
+                    options=team_list["id"].tolist(),
+                    format_func=lambda i: team_list.loc[team_list["id"]==i, "name"].iloc[0],
+                    key=f"team_sel_{rid}"
+                )
+                mark_presence = c3.checkbox("Marcar presença", value=True, key=f"presence_{rid}")
+
+                ok_link_sel = st.form_submit_button("Atualizar seleção")
+                if ok_link_sel:
+                    st.session_state[sel_key_link] = list(sel_players_tmp)
+
+            sel_players = st.session_state[sel_key_link]
 
             if st.button("Vincular selecionados", key=f"bulk_link_{rid}"):
-                team_name = team_list.loc[team_list["id"]==team_id, "name"].iloc[0]
-                linked = 0
-                for pid in sel_players:
-                    try:
-                        exec_sql(
-                            "INSERT INTO player_round(round_id, player_id, presence, team_round_id) "
-                            "VALUES(:r,:p,:pr,:t)",
-                            {"r": rid, "p": int(pid), "pr": 1 if mark_presence else 0, "t": int(team_id)},
-                        )
-                    except Exception:
-                        exec_sql(
-                            "UPDATE player_round SET team_round_id=:t, presence=:pr "
-                            "WHERE round_id=:r AND player_id=:p",
-                            {"r": rid, "p": int(pid), "pr": 1 if mark_presence else 0, "t": int(team_id)},
-                        )
-                    linked += 1
-                recalc_round(rid)
-                st.success(f"{linked} jogador(es) vinculados ao {team_name}.")
+                if not sel_players:
+                    st.warning("Selecione ao menos um jogador.")
+                else:
+                    team_name = team_list.loc[team_list["id"]==team_id, "name"].iloc[0]
+                    linked = 0
+                    for pid in sel_players:
+                        try:
+                            exec_sql(
+                                "INSERT INTO player_round(round_id, player_id, presence, team_round_id) "
+                                "VALUES(:r,:p,:pr,:t)",
+                                {"r": rid, "p": int(pid), "pr": 1 if mark_presence else 0, "t": int(team_id)},
+                            )
+                        except Exception:
+                            exec_sql(
+                                "UPDATE player_round SET team_round_id=:t, presence=:pr "
+                                "WHERE round_id=:r AND player_id=:p",
+                                {"r": rid, "p": int(pid), "pr": 1 if mark_presence else 0, "t": int(team_id)},
+                            )
+                        linked += 1
+                    recalc_round(rid)
+                    st.success(f"{linked} jogador(es) vinculados ao {team_name}.")
 
         st.divider()
         st.markdown("### 📥 Importar vínculos (Data; Nome; Time)")
@@ -1626,10 +1743,12 @@ with tabs[3]:
             except Exception as e:
                 st.error(f"Erro ao importar cartões: {e}")
 
-    # ===== Lista de Rodadas (FINAL) =====
+    # 4) Lista de Rodadas — sempre visível na aba 📆
     st.divider()
     st.markdown("### Lista de Rodadas")
     st.dataframe(rounds, use_container_width=True, hide_index=True, key="rounds_table_guided_v2")
+
+
 
 # ---- Classificações ----
 with tabs[4]:
@@ -1896,6 +2015,8 @@ with tabs[6]:
 
     seasons = _season_list()
     sel_season = st.selectbox("Temporada", options=seasons, index=len(seasons)-1, key="cash_season")
+    # força temporada válida (fallback para ano corrente)
+    sel_season = normalize_season(sel_season) or str(date.today().year)
     st.caption(f"Caixa da Temporada **{sel_season}**")
 
     # Saldo inicial
