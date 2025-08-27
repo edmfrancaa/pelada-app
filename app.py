@@ -340,18 +340,22 @@ def import_player_links(df: pd.DataFrame):
         if not d_iso or not pid:
             missing += 1; continue
         rid = upsert_player_round_for_date(pid, d_iso)
-        tid = get_or_create_team_round(rid, tname)
         try:
             exec_sql(
-                "INSERT INTO player_round(round_id, player_id, team_round_id, presence, wins, draws, points, photos) "
-                "VALUES(:r,:p,:t,1,0,0,0,0)",
-                {"r": rid, "p": pid, "t": tid},
+                "INSERT INTO player_round(round_id, player_id, presence, yellow_cards, red_cards) "
+                "VALUES(:r,:p,1,0,0)",
+                {"r": rid, "p": pid},
             )
         except Exception:
+            pass
+        try:
+            tid = get_or_create_team_round(rid, tname)
             exec_sql(
                 "UPDATE player_round SET team_round_id=:t, presence=1 WHERE round_id=:r AND player_id=:p",
                 {"r": rid, "p": pid, "t": tid},
             )
+        except Exception:
+            pass
         rows += 1
     recalc_all_rounds(close_all=False, regen_notes=True)
     return {"rows": rows, "missing_players": missing}
@@ -480,6 +484,7 @@ def classificacao_df(period: dict=None):
         COALESCE(SUM(pr.foto_bonus),0)       AS fotos_qtd_total,
         COALESCE(SUM(pr.points),0)           AS pontos_total,
         COALESCE(SUM(pr.wins),0)             AS vitorias_total,
+        COALESCE(SUM(pr.draws),0)            AS empates_total,   -- NOVO
         COALESCE(SUM(pr.red_cards),0)        AS verm_total,
         COALESCE(SUM(pr.yellow_cards),0)     AS amarelo_total,
         COALESCE(SUM(pr.bola_murcha),0)      AS bola_murcha_total,
@@ -497,7 +502,7 @@ def classificacao_df(period: dict=None):
     df["aproveitamento_fotos"] = df.apply(
         lambda r: (r["fotos_qtd_total"]/r["presencas_total"]) if r["presencas_total"] else 0.0, axis=1
     )
-    for c in ["fotos_qtd_total","pontos_total","vitorias_total","verm_total","amarelo_total","bola_murcha_total","presencas_total"]:
+    for c in ["fotos_qtd_total","pontos_total","vitorias_total","empates_total","verm_total","amarelo_total","bola_murcha_total","presencas_total"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
 
     df = df.sort_values(
@@ -513,7 +518,8 @@ def prepare_class_table(df: pd.DataFrame, hide_cards: bool=False) -> pd.DataFram
     for col in ["player_id","tipo"]:
         if col in df2.columns: df2 = df2.drop(columns=[col])
 
-    desired = ["Posição","jogador","fotos_qtd_total","pontos_total","vitorias_total","verm_total","amarelo_total","bola_murcha_total","presencas_total","aproveitamento_fotos"]
+    # inclui Empates logo após Vitórias
+    desired = ["Posição","jogador","fotos_qtd_total","pontos_total","vitorias_total","empates_total","verm_total","amarelo_total","bola_murcha_total","presencas_total","aproveitamento_fotos"]
     keep = [c for c in desired if c in df2.columns] + [c for c in df2.columns if c not in desired]
     df2 = df2[keep]
 
@@ -521,19 +527,19 @@ def prepare_class_table(df: pd.DataFrame, hide_cards: bool=False) -> pd.DataFram
         for c in ["verm_total","amarelo_total"]:
             if c in df2.columns: df2 = df2.drop(columns=[c])
 
-    for c in ["fotos_qtd_total","pontos_total","vitorias_total","verm_total","amarelo_total","bola_murcha_total","presencas_total","aproveitamento_fotos"]:
+    for c in ["fotos_qtd_total","pontos_total","vitorias_total","empates_total","verm_total","amarelo_total","bola_murcha_total","presencas_total","aproveitamento_fotos"]:
         if c in df2.columns: df2[c] = pd.to_numeric(df2[c], errors="coerce")
 
     if "aproveitamento_fotos" in df2.columns:
         df2["aproveitamento_fotos"] = (df2["aproveitamento_fotos"].fillna(0.0)*100).round(2).map(lambda v: f"{float(v):.2f}%".replace(".",","))
 
-    for c in ["fotos_qtd_total","pontos_total","vitorias_total","verm_total","amarelo_total","bola_murcha_total","presencas_total"]:
+    for c in ["fotos_qtd_total","pontos_total","vitorias_total","empates_total","verm_total","amarelo_total","bola_murcha_total","presencas_total"]:
         if c in df2.columns: df2[c] = df2[c].fillna(0).astype(int)
 
     df2["jogador"] = df2["jogador"].astype(str)
 
     return df2.rename(columns={
-        "fotos_qtd_total":"Fotos","pontos_total":"Pontos","vitorias_total":"Vitórias",
+        "fotos_qtd_total":"Fotos","pontos_total":"Pontos","vitorias_total":"Vitórias","empates_total":"Empates",
         "verm_total":"Vermelhos","amarelo_total":"Amarelos","bola_murcha_total":"Bola Murcha",
         "presencas_total":"Presenças","aproveitamento_fotos":"%"
     })
@@ -977,6 +983,10 @@ with tabs[0]:
     st.subheader("Configurações gerais")
     with st.form("pelada_form"):
         ln = st.text_input("Nome da Pelada", value=get_setting("league_name","Pelada do Pivete"), key="ln_set")
+        # NOVOS CAMPOS
+        loc = st.text_input("Local da Pelada", value=get_setting("league_location",""), key="loc_set")
+        pix = st.text_input("Pix (recebimento)", value=get_setting("pix_key",""), key="pix_set")
+
         c1,c2 = st.columns(2)
         monthly = c1.number_input("Valor Mensal (R$)", min_value=0.0, step=1.0, value=float(get_setting("monthly_fee","0") or 0), key="mfee")
         single  = c2.number_input("Valor Avulso (R$)", min_value=0.0, step=1.0, value=float(get_setting("single_fee","0") or 0), key="sfee")
@@ -995,6 +1005,8 @@ with tabs[0]:
 
         if st.form_submit_button("Salvar configurações"):
             set_setting("league_name", ln.strip() or "Pelada")
+            set_setting("league_location", loc.strip())   # novo
+            set_setting("pix_key", pix.strip())           # novo
             set_setting("monthly_fee", monthly)
             set_setting("single_fee", single)
             set_setting("rent_court", rent)
@@ -1189,7 +1201,7 @@ with tabs[2]:
                     "date": rdate.isoformat(),
                     "season": season_norm,
                     "teams": teams,
-                    "selected": list(map(int, selected_ids)),  # <- novo: guarda os selecionados
+                    "selected": list(map(int, selected_ids)),  # <- guarda os selecionados
                     "unassigned_gk": unassigned_gk
                 }
                 st.success("Times sorteados! Veja a prévia abaixo.")
@@ -1310,6 +1322,11 @@ with tabs[3]:
 
     rid = st.selectbox("Selecione a rodada", options=rounds["id"].tolist(),
                        format_func=lambda x: f"#{x}", key="rid_sel")
+
+    # Botão rápido de recálculo nesta aba (NOVO)
+    if st.button("🔁 Recalcular esta rodada", key=f"recalc_round_quick_{rid}"):
+        recalc_round(rid)
+        st.success("Rodada recalculada!")
 
     # ====== VISÃO GUIADA (Times horizontais + GKs + Cartões) ======
     st.markdown("### Times da Rodada (sorteio) — visão horizontal")
@@ -1969,7 +1986,7 @@ with tabs[5]:
                 recalc_round(rid_a); st.success("Goleiros salvos e rodada recalculada.")
             del_g = st.multiselect("Lançamentos de goleiros para excluir",
                                    options=edited_g["id"].tolist() if not df_g.empty else [],
-                                   format_func=lambda i: edited_g.loc[edited_g["id"]==i, "Goleiro"].iloc[0] if not edited_g.empty else str(i),
+                                   format_func=lambda i: edited_g.loc[edited_g["id"]==i, "Goleiro"].iloc[0] if not df_g.empty else str(i),
                                    key=f"delgk_{rid_a}")
             if st.button("Excluir lançamentos de goleiros", key=f"btn_delgk_{rid_a}"):
                 for gid in del_g:
@@ -1994,7 +2011,7 @@ with tabs[5]:
                 st.success("Cartões salvos.")
             del_c = st.multiselect("Lançamentos de cartões para excluir",
                                    options=edited_c["id"].tolist() if not df_c.empty else [],
-                                   format_func=lambda i: edited_c.loc[edited_c["id"]==i, "Jogador"].iloc[0] if not edited_c.empty else str(i),
+                                   format_func=lambda i: edited_c.loc[edited_c["id"]==i, "Jogador"].iloc[0] if not df_c.empty else str(i),
                                    key=f"delcards_{rid_a}")
             if st.button("Excluir cartões selecionados", key=f"btn_delcards_{rid_a}"):
                 for cid in del_c:
@@ -2035,7 +2052,7 @@ with tabs[6]:
     if mtx.empty:
         st.info("Nenhum mensalista ativo cadastrado (Plano = Mensalista).")
     else:
-        # esconde ID na UI mas adiciona Nome na segunda coluna (fixada)
+        # esconde ID na UI mas adiciona Nome na segunda coluna (fixada removida)
         ui = mtx.rename(columns={"player_id":"ID"}).set_index("ID").reset_index()
         ids_list = ui["ID"].dropna().astype(int).tolist()
         in_sql, in_params = _expand_in(ids_list, "pid")
@@ -2052,7 +2069,7 @@ with tabs[6]:
             num_rows="dynamic",
             key=f"ed_cash_mtx_{sel_season}",
             column_config={
-                "Nome": st.column_config.TextColumn(disabled=True, pinned=True)
+                "Nome": st.column_config.TextColumn(disabled=True)  # sem pinned
             },
             height=420)
 
