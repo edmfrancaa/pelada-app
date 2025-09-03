@@ -1,0 +1,26 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenv
+.env/
+.venv/
+env/
+venv/
+
+# VSCode / PyCharm
+.vscode/
+.idea/
+
+# Arquivos de dados gerados pelo app
+data/*.sqlite
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Relatórios temporários
+*.pdf
+*.xlsx
+*.csv
