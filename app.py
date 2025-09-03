@@ -7,9 +7,9 @@
 import streamlit as st
 import pandas as pd
 from sqlalchemy import text, create_engine
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
-import calendar, re, urllib.parse, math, random, os
+import calendar, re, urllib.parse, math, random, os, secrets
 
 # --- PDF (ReportLab) opcional ---
 try:
@@ -28,10 +28,68 @@ auth = AuthManager()
 st.set_page_config(page_title="⚽ Pelada", page_icon="⚽", layout="wide")
 
 # -----------------------------------------------------------------------------------
-#  SISTEMA DE MULTI-USUÁRIO
+#  SISTEMA DE MULTI-USUÁRIO + "LEMBRAR-ME" (Link de acesso rápido)
 #  - Primeiro mostra login/cadastro
 #  - Após login: troca o "engine" para o banco do usuário e garante o schema mínimo
+#  - "Lembrar-me": gera token guardado em ./data/_tokens.sqlite e coloca ?t=<token> na URL
+#    Reabrindo o app com o mesmo link, o usuário é autenticado automaticamente.
 # -----------------------------------------------------------------------------------
+
+# *** Banco global de tokens (independe do usuário logado) ***
+os.makedirs("data", exist_ok=True)
+TOK_DB_PATH = "sqlite:///data/_tokens.sqlite"
+tok_engine = create_engine(TOK_DB_PATH, future=True, echo=False)
+
+def _ensure_tokens_schema():
+    with tok_engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                token TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+        """))
+_ensure_tokens_schema()
+
+def _token_insert(username:str, days:int=30) -> str:
+    token = secrets.token_urlsafe(32)
+    now = datetime.utcnow()
+    exp = now + timedelta(days=days)
+    with tok_engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO auth_tokens(token, username, created_at, expires_at) VALUES(:t,:u,:c,:e)"),
+            {"t": token, "u": username, "c": now.isoformat(), "e": exp.isoformat()}
+        )
+    return token
+
+def _token_get_username(token:str):
+    if not token: return None
+    with tok_engine.begin() as conn:
+        df = pd.read_sql(text("""
+            SELECT username, expires_at FROM auth_tokens WHERE token=:t
+        """), conn, params={"t": token})
+    if df.empty:
+        return None
+    try:
+        exp = datetime.fromisoformat(str(df.iloc[0]["expires_at"]))
+    except Exception:
+        return None
+    if datetime.utcnow() > exp:
+        # expirou: limpa
+        with tok_engine.begin() as conn:
+            conn.execute(text("DELETE FROM auth_tokens WHERE token=:t"), {"t": token})
+        return None
+    return str(df.iloc[0]["username"])
+
+def _token_delete(token:str):
+    if not token: return
+    with tok_engine.begin() as conn:
+        conn.execute(text("DELETE FROM auth_tokens WHERE token=:t"), {"t": token})
+
+def _token_delete_user(username:str):
+    with tok_engine.begin() as conn:
+        conn.execute(text("DELETE FROM auth_tokens WHERE username=:u"), {"u": username})
 
 # Engine global, trocado após login
 engine = None
@@ -223,17 +281,6 @@ def ensure_user_schema(_engine):
           description TEXT,
           value REAL
         )"""))
-
-        # --- NOVO: vínculo opcional do lançamento manual com a rodada ---
-        try:
-            conn.execute(text("ALTER TABLE cash_extra ADD COLUMN round_id INTEGER"))
-        except Exception:
-            pass
-        try:
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_cash_extra_round ON cash_extra(round_id)"))
-        except Exception:
-            pass
-
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS cash_opening (
           season TEXT PRIMARY KEY,
@@ -251,16 +298,30 @@ def ensure_user_schema(_engine):
     _maybe_set("players_per_team_line", "5")
 
 # -----------------------------------------------------------------------------------
-#  LOGIN / LOGOUT UI
+#  LOGIN / LOGOUT UI + AUTOLOGIN POR TOKEN (?t=...)
 # -----------------------------------------------------------------------------------
 
 def _login_view():
     st.title("⚽ Pelada — Login")
+
+    # Autologin via token na URL (se ainda não autenticado)
+    qp = st.query_params
+    token_in = qp.get("t")
+    if isinstance(token_in, list):
+        token_in = token_in[0] if token_in else None
+    if token_in and "auth_user" not in st.session_state:
+        uname = _token_get_username(str(token_in))
+        if uname:
+            st.session_state["auth_user"] = uname
+            st.success(f"Bem-vindo de volta, {uname}! (login automático)")
+            st.rerun()
+
     tab_login, tab_signup = st.tabs(["Entrar", "Criar conta"])
 
     with tab_login:
         u = st.text_input("Usuário", key="login_user")
         p = st.text_input("Senha", type="password", key="login_pass")
+        remember = st.checkbox("Lembrar-me (gerar link de acesso rápido por 30 dias)", value=True, key="remember_me")
         if st.button("Entrar", type="primary", key="btn_login"):
             user = auth.get_user(u)
             if not user:
@@ -268,6 +329,11 @@ def _login_view():
             else:
                 if auth.verify_password(p, user["password_hash"]):
                     st.session_state["auth_user"] = u.strip()
+                    if remember:
+                        tok = _token_insert(u.strip(), days=30)
+                        # coloca o token na URL atual
+                        st.query_params.update({"t": tok})
+                        st.info("Login salvo neste link (válido por 30 dias). Favor adicionar aos favoritos.")
                     st.rerun()
                 else:
                     st.error("Senha incorreta.")
@@ -299,7 +365,7 @@ def _ensure_user_engine_and_schema():
     ensure_user_schema(engine)
     return True
 
-# Se não logado, mostra login e sai
+# Se não logado, tenta autologin por token; se falhar, mostra login e sai
 if "auth_user" not in st.session_state:
     _login_view()
     st.stop()
@@ -308,6 +374,27 @@ if not _ensure_user_engine_and_schema():
     st.error("Falha ao abrir banco do usuário.")
     st.stop()
 
+# Barra lateral: info do usuário + link rápido
+with st.sidebar:
+    st.markdown(f"**👤 Usuário:** {st.session_state.get('auth_user','-')}")
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Sair", use_container_width=True, key="btn_logout"):
+            # limpar tokens deste usuário (opcional) e sessão
+            _token_delete_user(st.session_state.get("auth_user"))
+            st.session_state.pop("auth_user", None)
+            # remove token da URL atual
+            current = dict(st.query_params)
+            if "t" in current: del current["t"]
+            st.query_params.clear()
+            if current:
+                st.query_params.update(current)
+            st.rerun()
+    with colB:
+        if st.button("Gerar link rápido", use_container_width=True, key="btn_make_fastlink"):
+            tok = _token_insert(st.session_state.get("auth_user"), days=30)
+            st.query_params.update({"t": tok})
+            st.success("Link de acesso rápido gerado (válido por 30 dias). Adicione esta página aos favoritos.")
 
 #Parte 2/10
 
