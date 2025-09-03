@@ -2138,7 +2138,6 @@ with tabs[5]:
     if rounds_admin.empty:
         st.info("Cadastre ao menos uma rodada.")
     else:
-        # garantir tipo int e montar mapa id -> data para o format_func
         rounds_admin["id"] = pd.to_numeric(rounds_admin["id"], errors="coerce").fillna(0).astype(int)
         id2date = {int(r.id): str(r.date) for r in rounds_admin.itertuples(index=False)}
 
@@ -2255,10 +2254,25 @@ with tabs[5]:
 with tabs[6]:
     st.subheader("💰 Controle de Caixa")
 
+    # Helper: última data de rodada da temporada
+    def _last_round_date_for_season(season:str):
+        df = df_query("SELECT MAX(date) AS d FROM rounds WHERE COALESCE(season,'')=:s", {"s": season})
+        if df.empty or pd.isna(df.iloc[0]["d"]):
+            return None
+        try:
+            return datetime.fromisoformat(str(df.iloc[0]["d"])).date()
+        except Exception:
+            try:
+                return pd.to_datetime(str(df.iloc[0]["d"])).date()
+            except Exception:
+                return None
+
     seasons = _season_list()
     sel_season = st.selectbox("Temporada", options=seasons, index=len(seasons)-1, key="cash_season")
     sel_season = normalize_season(sel_season) or str(date.today().year)
     st.caption(f"Caixa da Temporada **{sel_season}**")
+
+    last_round_dt = _last_round_date_for_season(sel_season)
 
     c1, _ = st.columns([2,1])
     with c1:
@@ -2303,267 +2317,339 @@ with tabs[6]:
 
     st.divider()
 
+    # ========== LANÇAMENTOS MANUAIS (FÁCIL) + GRADE (c/ limite de data) ==========
     st.markdown("### 🧮 Lançamentos manuais (Entradas/Saídas)")
-    df_extra = df_query("""
-        SELECT id, date AS Data, type AS Tipo, description AS Descrição, value AS Valor
-          FROM cash_extra
-         WHERE season=:s
-         ORDER BY date
-    """, {"s": sel_season})
-    ed_extra = st.data_editor(df_extra, use_container_width=True, num_rows="dynamic", key=f"ed_cash_extra_{sel_season}")
+
+    # Formulário simples vinculado à rodada (data vem da rodada)
+    _rds = df_query(
+        "SELECT id, date, COALESCE(notes,'') AS notes "
+        "FROM rounds WHERE COALESCE(season,'')=:s ORDER BY date DESC",
+        {"s": sel_season}
+    )
+    if _rds.empty:
+        st.info("Não há rodadas nesta temporada. Crie uma rodada para habilitar o lançamento rápido.")
+    else:
+        def _fmt_round_opt(i:int):
+            row = _rds[_rds["id"]==i].iloc[0]
+            n = (str(row["notes"]).strip() or f"#{int(i)}")
+            return f"{n} — {row['date']}"
+
+        colf1, colf2 = st.columns([2, 1])
+        with colf1:
+            sel_round_id = st.selectbox(
+                "Rodada",
+                options=_rds["id"].astype(int).tolist(),
+                format_func=_fmt_round_opt,
+                key=f"cash_fast_round_{sel_season}"
+            )
+        with colf2:
+            fast_type = st.selectbox("Tipo", ["Entrada", "Saída"], key=f"cash_fast_type_{sel_season}")
+
+        colf3, colf4 = st.columns([3, 1])
+        with colf3:
+            fast_desc = st.text_input("Descrição", key=f"cash_fast_desc_{sel_season}", placeholder="Ex.: Doação, Água, Material, etc.")
+        with colf4:
+            fast_val = st.number_input("Valor (R$)", min_value=0.0, step=1.0, value=0.0, key=f"cash_fast_val_{sel_season}")
+
+        if st.button("➕ Adicionar lançamento", key=f"cash_fast_add_{sel_season}"):
+            if not sel_round_id:
+                st.warning("Selecione a rodada.")
+            elif (fast_val or 0.0) <= 0.0:
+                st.warning("Informe um valor maior que zero.")
+            else:
+                rrow = _rds[_rds["id"]==int(sel_round_id)].iloc[0]
+                rdate_iso = str(rrow["date"])
+                if last_round_dt and datetime.fromisoformat(rdate_iso).date() > last_round_dt:
+                    st.error("Data do lançamento excede a última rodada da temporada.")
+                else:
+                    exec_sql(
+                        "INSERT INTO cash_extra(date, season, type, description, value) "
+                        "VALUES(:d,:s,:t,:ds,:v)",
+                        {"d": rdate_iso, "s": sel_season, "t": fast_type, "ds": fast_desc.strip(), "v": float(fast_val)}
+                    )
+                    st.success("Lançamento adicionado com sucesso.")
+
+    # Grade (limitando por data)
+    if last_round_dt:
+        df_extra = df_query("""
+            SELECT id,
+                   date AS Data,
+                   type AS Tipo,
+                   description AS Descrição,
+                   value AS Valor
+              FROM cash_extra
+             WHERE season=:s
+               AND date <= :lim
+             ORDER BY date
+        """, {"s": sel_season, "lim": last_round_dt.isoformat()})
+    else:
+        df_extra = df_query("""
+            SELECT id,
+                   date AS Data,
+                   type AS Tipo,
+                   description AS Descrição,
+                   value AS Valor
+              FROM cash_extra
+             WHERE season=:s
+             ORDER BY date
+        """, {"s": sel_season})
+
+    st.caption("Edite abaixo se necessário (observa o limite da última rodada para salvar).")
+    ed_extra = st.data_editor(
+        df_extra,
+        use_container_width=True,
+        num_rows="dynamic",
+        key=f"ed_cash_extra_{sel_season}"
+    )
+
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("Salvar lançamentos", key=f"save_cash_extra_{sel_season}"):
+        if st.button("💾 Salvar lançamentos", key=f"save_cash_extra_{sel_season}"):
             for _, r in ed_extra.iterrows():
                 rid = r.get("id")
-                d   = str(r.get("Data") or "").strip()
+                raw_d = r.get("Data")
                 try:
-                    d_iso = parse_br_date(d) or (pd.to_datetime(d).date().isoformat() if d else None)
+                    d_iso = parse_br_date(raw_d) or (pd.to_datetime(raw_d).date().isoformat() if raw_d else None)
                 except Exception:
                     d_iso = None
-                tp  = str(r.get("Tipo") or "Entrada")
-                desc= str(r.get("Descrição") or "")
-                val = float(pd.to_numeric(r.get("Valor"), errors="coerce") or 0.0)
+
+                if last_round_dt and d_iso:
+                    try:
+                        _d = datetime.fromisoformat(d_iso).date()
+                    except Exception:
+                        _d = pd.to_datetime(d_iso).date()
+                    if _d > last_round_dt:
+                        st.error(f"Data '{raw_d}' excede a última rodada ({last_round_dt.isoformat()}). Ajuste antes de salvar.")
+                        st.stop()
+
+                tp   = str(r.get("Tipo") or "Entrada").strip() or "Entrada"
+                desc = str(r.get("Descrição") or "").strip()
+                val  = float(pd.to_numeric(r.get("Valor"), errors="coerce") or 0.0)
+
                 if pd.isna(rid) or rid is None:
-                    exec_sql("INSERT INTO cash_extra(date, season, type, description, value) VALUES(:d,:s,:t,:ds,:v)",
-                             {"d": d_iso, "s": sel_season, "t": tp, "ds": desc, "v": val})
+                    exec_sql(
+                        "INSERT INTO cash_extra(date, season, type, description, value) "
+                        "VALUES(:d,:s,:t,:ds,:v)",
+                        {"d": d_iso, "s": sel_season, "t": tp, "ds": desc, "v": val}
+                    )
                 else:
-                    exec_sql("UPDATE cash_extra SET date=:d, type=:t, description=:ds, value=:v WHERE id=:id",
-                             {"d": d_iso, "t": tp, "ds": desc, "v": val, "id": int(rid)})
+                    exec_sql(
+                        "UPDATE cash_extra SET date=:d, type=:t, description=:ds, value=:v "
+                        "WHERE id=:id",
+                        {"d": d_iso, "t": tp, "ds": desc, "v": val, "id": int(rid)}
+                    )
             st.success("Lançamentos salvos.")
     with c2:
-        to_del = st.multiselect("Selecionar lançamentos para excluir", options=ed_extra["id"].dropna().astype(int).tolist())
-        if st.button("Excluir selecionados", key=f"del_cash_extra_{sel_season}"):
+        to_del = st.multiselect(
+            "Selecionar lançamentos para excluir",
+            options=ed_extra["id"].dropna().astype(int).tolist() if not ed_extra.empty else [],
+            key=f"del_cash_extra_list_{sel_season}"
+        )
+        if st.button("🗑 Excluir selecionados", key=f"del_cash_extra_{sel_season}"):
             for i in to_del:
                 exec_sql("DELETE FROM cash_extra WHERE id=:id", {"id": int(i)})
             st.success("Lançamentos excluídos.")
 
     st.divider()
 
-    # =========================
-    # 📅 Resumo por mês (capado até a última rodada da temporada)
-    # =========================
-    st.markdown("### 📅 Resumo por mês")
+    # =================== RESUMO POR MÊS (até última rodada) ===================
+    st.markdown("### 📅 Resumo por mês (até a última rodada)")
+    mm = st.selectbox("Mês", options=list(range(1,13)), format_func=lambda m: f"{_month_name_pt(m)}/{sel_season}", key=f"cash_month_{sel_season}")
 
-    # última data de rodada desta temporada
-    _last = df_query(
-        "SELECT MAX(date) AS d FROM rounds WHERE COALESCE(season,'') = :s",
-        {"s": sel_season}
-    )
-    last_round_iso = str(_last.iloc[0]["d"]) if not _last.empty and pd.notna(_last.iloc[0]["d"]) else None
+    # Limites do mês
+    m_start, m_end = _month_bounds(sel_season, mm)
+    m_start_d = datetime.fromisoformat(m_start).date()
+    m_end_d   = datetime.fromisoformat(m_end).date()
+    # Se houver última rodada, cortar o fim do período
+    if last_round_dt:
+        if last_round_dt < m_start_d:
+            # não há dados válidos neste mês ainda
+            eff_start, eff_end = None, None
+        else:
+            eff_start = m_start_d
+            eff_end   = min(m_end_d, last_round_dt)
+    else:
+        eff_start, eff_end = m_start_d, m_end_d
 
-    mm = st.selectbox(
-        "Mês",
-        options=list(range(1, 13)),
-        format_func=lambda m: f"{_month_name_pt(m)}/{sel_season}",
-        key=f"cash_month_{sel_season}"
-    )
-
-    # helper local: resumo do mês respeitando limite (last_round_iso)
-    def _month_summary_capped(season: str, month: int, cap_iso: str | None):
-        # settings
-        monthly_fee = float(get_setting("monthly_fee", "0") or 0)
-        single_fee  = float(get_setting("single_fee", "0") or 0)
-        rent        = float(get_setting("rent_court", "0") or 0)   # por mês
-        ref_fee     = float(get_setting("referee_fee", "0") or 0)  # por rodada
-        has_ref     = (get_setting("has_referee","0") == "1")
-        yc_fee      = float(get_setting("yellow_card_fee","0") or 0)
-        rc_fee      = float(get_setting("red_card_fee","0") or 0)
-
-        y = normalize_season(season) or str(date.today().year)
-        d1, d2 = _month_bounds(y, month)
-
-        # aplica o limite
-        if cap_iso:
-            cap = date.fromisoformat(cap_iso)
-            if date.fromisoformat(d1) > cap:
-                # mês totalmente no futuro → tudo zero
-                return {"entradas":{}, "saidas":{}, "tin":0.0, "tout":0.0, "saldo":0.0}
-            if date.fromisoformat(d2) > cap:
-                d2 = cap.isoformat()
-
-        # contadores baseados em rodadas (já naturalmente cortados por d2)
-        rounds_m = int(df_query(
-            "SELECT COUNT(*) AS n FROM rounds WHERE date BETWEEN :a AND :b",
-            {"a": d1, "b": d2}
-        ).iloc[0]["n"] or 0)
-
-        avulsos_m = int(df_query("""
-            SELECT COUNT(*) AS n
-              FROM player_round pr
-              JOIN rounds r  ON r.id = pr.round_id
-              JOIN players p ON p.id = pr.player_id
-             WHERE pr.presence = 1
-               AND COALESCE(p.plan,'Mensalista') = 'Avulso'
-               AND r.date BETWEEN :a AND :b
-        """, {"a": d1, "b": d2}).iloc[0]["n"] or 0)
-
-        cards = df_query("""
-            SELECT
-               COALESCE(SUM(pr.yellow_cards),0) AS ca,
-               COALESCE(SUM(pr.red_cards),0)    AS cv
-              FROM player_round pr
-              JOIN rounds r ON r.id = pr.round_id
-             WHERE r.date BETWEEN :a AND :b
-        """, {"a": d1, "b": d2})
-        ca = int(cards.iloc[0]["ca"] or 0) if not cards.empty else 0
-        cv = int(cards.iloc[0]["cv"] or 0) if not cards.empty else 0
-        cards_income = (ca * yc_fee) + (cv * rc_fee)
-
-        # extras (capados pela data)
-        ex = df_query("""
+    # Função helper local para somatórios filtrando data
+    def _sum_cash_extra(season:str, start_d:date, end_d:date):
+        if not start_d or not end_d:
+            return 0.0, 0.0
+        df = df_query("""
             SELECT COALESCE(type,'') AS type, COALESCE(value,0) AS value
               FROM cash_extra
-             WHERE season = :s AND date BETWEEN :a AND :b
-        """, {"s": y, "a": d1, "b": d2})
-        extra_in  = float(ex[ex["type"] == "Entrada"]["value"].sum()) if not ex.empty else 0.0
-        extra_out = float(ex[ex["type"] == "Saída"]["value"].sum())   if not ex.empty else 0.0
+             WHERE season=:s AND date BETWEEN :a AND :b
+        """, {"s": season, "a": start_d.isoformat(), "b": end_d.isoformat()})
+        entradas = float(df[df["type"]=="Entrada"]["value"].sum()) if not df.empty else 0.0
+        saidas   = float(df[df["type"]=="Saída"]["value"].sum())   if not df.empty else 0.0
+        return entradas, saidas
 
-        # mensalistas (sinalizam o mês inteiro; mantemos se o mês não é futuro em relação ao cap)
-        mensalistas_pagantes = _mensalistas_paid_count(season, month) if (not cap_iso or date.fromisoformat(d1) <= date.fromisoformat(cap_iso)) else 0
+    # Cartões no mês (até o corte)
+    def _cards_sum(season:str, start_d:date, end_d:date):
+        if not start_d or not end_d:
+            return (0,0)
+        df = df_query("""
+          SELECT COALESCE(SUM(pr.yellow_cards),0) AS ca,
+                 COALESCE(SUM(pr.red_cards),0)    AS cv
+            FROM player_round pr
+            JOIN rounds r ON r.id=pr.round_id
+           WHERE r.date BETWEEN :a AND :b
+        """, {"a": start_d.isoformat(), "b": end_d.isoformat()})
+        if df.empty: return (0,0)
+        return int(df.iloc[0]["ca"] or 0), int(df.iloc[0]["cv"] or 0)
 
-        entradas = {
-            "Mensalidade": mensalistas_pagantes * monthly_fee,
-            "Avulsos":     avulsos_m * single_fee,
-            "Cartões (Entrada)": cards_income,
-            "Extras (Entrada)":  extra_in,
-        }
-        saidas = {
-            "Aluguel da quadra": rent if (not cap_iso or date.fromisoformat(d1) <= date.fromisoformat(cap_iso)) else 0.0,
-            "Juiz": (ref_fee * rounds_m) if has_ref else 0.0,
-            "Extras (Saída)": extra_out,
-        }
-        tin = float(sum(entradas.values()))
-        tout = float(sum(saidas.values()))
-        return {"entradas": entradas, "saidas": saidas, "tin": tin, "tout": tout, "saldo": tin - tout}
+    # Avulsos (presenças) no mês até o corte
+    def _avulsos_month(season:str, start_d:date, end_d:date):
+        if not start_d or not end_d:
+            return 0
+        df = df_query("""
+          SELECT COUNT(*) AS n
+            FROM player_round pr
+            JOIN rounds r  ON r.id=pr.round_id
+            JOIN players p ON p.id=pr.player_id
+           WHERE pr.presence=1
+             AND COALESCE(p.plan,'Mensalista')='Avulso'
+             AND r.date BETWEEN :a AND :b
+        """, {"a": start_d.isoformat(), "b": end_d.isoformat()})
+        return int(df.iloc[0]["n"] or 0) if not df.empty else 0
 
-    # aplica o resumo capado
-    mres = _month_summary_capped(sel_season, mm, last_round_iso)
+    # Quantas rodadas no mês até o corte (para juiz)
+    def _rounds_in_month(start_d:date, end_d:date):
+        if not start_d or not end_d:
+            return 0
+        df = df_query("SELECT COUNT(*) AS n FROM rounds WHERE date BETWEEN :a AND :b", {"a": start_d.isoformat(), "b": end_d.isoformat()})
+        return int(df.iloc[0]["n"] or 0) if not df.empty else 0
 
-    # monta tabela exibida
+    monthly_fee = float(get_setting("monthly_fee","0") or 0)
+    single_fee  = float(get_setting("single_fee","0") or 0)
+    rent        = float(get_setting("rent_court","0") or 0)
+    ref_fee     = float(get_setting("referee_fee","0") or 0)
+    has_ref     = (get_setting("has_referee","0")=="1")
+    yc_fee      = float(get_setting("yellow_card_fee","0") or 0)
+    rc_fee      = float(get_setting("red_card_fee","0") or 0)
+
+    # Mensalistas pagos no mês (sem corte por dia — é um flag mensal)
+    m_mensalistas = _mensalistas_paid_count(sel_season, mm)
+
+    # Entradas / Saídas extras até o corte
+    extra_in, extra_out = _sum_cash_extra(sel_season, eff_start, eff_end)
+    # Avulsos e rodadas até o corte
+    m_avulsos = _avulsos_month(sel_season, eff_start, eff_end)
+    rounds_m  = _rounds_in_month(eff_start, eff_end)
+    # Cartões até o corte
+    ca, cv = _cards_sum(sel_season, eff_start, eff_end)
+    cards_income = (ca * yc_fee) + (cv * rc_fee)
+
+    entradas = {
+        "Mensalidade": m_mensalistas * monthly_fee,
+        "Avulsos":     m_avulsos * single_fee,
+        "Cartões (Entrada)": cards_income,
+        "Extras (Entrada)": extra_in,
+    }
+    saidas = {
+        "Aluguel da quadra": rent if eff_start else 0.0,  # aluguel é mensal; mantém se o mês está “liberado”
+        "Juiz": (ref_fee * rounds_m) if has_ref else 0.0,
+        "Extras (Saída)": extra_out,
+    }
+    tin = sum(entradas.values())
+    tout = sum(saidas.values())
+    saldo_mes = tin - tout
+
+    # Tabela do mês
     linhas = []
-    for desc, v in mres["entradas"].items():
-        linhas.append([f"{_month_name_pt(mm)}/{sel_season}", "Entrada", desc, float(v)])
-    for desc, v in mres["saidas"].items():
-        linhas.append([f"{_month_name_pt(mm)}/{sel_season}", "Saída", desc, float(v)])
-
+    label_mes = f"{_month_name_pt(mm)}/{sel_season}"
+    for desc_i, v in entradas.items():
+        linhas.append([label_mes, "Entrada", desc_i, float(v)])
+    for desc_i, v in saidas.items():
+        linhas.append([label_mes, "Saída", desc_i, float(v)])
     df_res = pd.DataFrame(linhas, columns=["Mês/Ano","Tipo","Descrição","Valor"])
     st.dataframe(df_res, use_container_width=True, hide_index=True)
 
-    # label “até …” quando o mês é o mesmo da última rodada
-    cap_label = ""
-    if last_round_iso:
-        lr = date.fromisoformat(last_round_iso)
-        if lr.year == int(sel_season) and lr.month == mm:
-            cap_label = f" (até {lr.strftime('%d/%m/%Y')})"
-
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Entradas", f"R$ {mres['tin']:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-    c2.metric("Saídas",   f"R$ {mres['tout']:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-    c3.metric(f"Saldo do mês{cap_label}", f"R$ {mres['saldo']:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-    # saldo acumulado da temporada até este mês (sem corte histórico)
-    s_temp = _season_running_balance(sel_season, mm)
+    c1.metric("Entradas", f"R$ {tin:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+
+    c2_val = tout
+    c2.metric("Saídas",   f"R$ {c2_val:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+
+    c3.metric("Saldo do mês (até corte)", f"R$ {saldo_mes:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+
+    # Saldo acumulado da temporada até o mês selecionado (respeitando corte)
+    def _season_running_balance_with_cut(season:str, up_to_month:int, cut_dt:date):
+        opening = _get_opening(season)
+        acc = 0.0
+        for m in range(1, up_to_month+1):
+            ms, me = _month_bounds(season, m)
+            ms_d = datetime.fromisoformat(ms).date()
+            me_d = datetime.fromisoformat(me).date()
+            if cut_dt and cut_dt < ms_d:
+                break  # meses posteriores ao corte
+            eff_ms = ms_d
+            eff_me = min(me_d, cut_dt) if cut_dt else me_d
+
+            # recomputa “saldo do mês” como acima (sem repetir mensalistas pagos para meses > up_to_month)
+            m_mensal = _mensalistas_paid_count(season, m)
+            ex_in, ex_out = _sum_cash_extra(season, eff_ms, eff_me)
+            avu = _avulsos_month(season, eff_ms, eff_me)
+            rnd = _rounds_in_month(eff_ms, eff_me)
+            ca_i, cv_i = _cards_sum(season, eff_ms, eff_me)
+            cards_i = (ca_i * yc_fee) + (cv_i * rc_fee)
+
+            ent = (m_mensal * monthly_fee) + (avu * single_fee) + cards_i + ex_in
+            sai = (rent if eff_ms else 0.0) + ((ref_fee * rnd) if has_ref else 0.0) + ex_out
+            acc += (ent - sai)
+        return opening + acc
+
+    s_temp = _season_running_balance_with_cut(sel_season, mm, last_round_dt)
     c4.metric("Saldo da temporada", f"R$ {s_temp:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
 
     st.divider()
 
-    # =========================
-    # 📊 Resumo por ano (capado até a última rodada da temporada)
-    # =========================
-    st.markdown("### 📊 Resumo por ano")
+    # =================== RESUMO POR ANO (até última rodada) ===================
+    st.markdown("### 📊 Resumo do ano (até a última rodada)")
 
-    _last = df_query(
-        "SELECT MAX(date) AS d FROM rounds WHERE COALESCE(season,'') = :s",
-        {"s": sel_season}
-    )
-    last_round_iso = str(_last.iloc[0]["d"]) if not _last.empty and pd.notna(_last.iloc[0]["d"]) else None
+    def _year_summary(season:str, cut_dt:date):
+        rows = []
+        total_in = total_out = 0.0
+        for m in range(1,13):
+            ms, me = _month_bounds(season, m)
+            ms_d = datetime.fromisoformat(ms).date()
+            me_d = datetime.fromisoformat(me).date()
+            if cut_dt and cut_dt < ms_d:
+                break
+            eff_ms = ms_d
+            eff_me = min(me_d, cut_dt) if cut_dt else me_d
 
-    def _month_summary_capped_year(season: str, month: int, cap_iso: str | None):
-        # (versão minimal para o agregado anual)
-        monthly_fee = float(get_setting("monthly_fee", "0") or 0)
-        single_fee  = float(get_setting("single_fee", "0") or 0)
-        rent        = float(get_setting("rent_court", "0") or 0)
-        ref_fee     = float(get_setting("referee_fee", "0") or 0)
-        has_ref     = (get_setting("has_referee","0") == "1")
-        yc_fee      = float(get_setting("yellow_card_fee","0") or 0)
-        rc_fee      = float(get_setting("red_card_fee","0") or 0)
+            # Se não há nenhum dia válido no mês, pula
+            if cut_dt and cut_dt < ms_d:
+                continue
 
-        y = normalize_season(season) or str(date.today().year)
-        d1, d2 = _month_bounds(y, month)
+            m_mensal = _mensalistas_paid_count(season, m)
+            ex_in, ex_out = _sum_cash_extra(season, eff_ms, eff_me)
+            avu = _avulsos_month(season, eff_ms, eff_me)
+            rnd = _rounds_in_month(eff_ms, eff_me)
+            ca_i, cv_i = _cards_sum(season, eff_ms, eff_me)
+            cards_i = (ca_i * yc_fee) + (cv_i * rc_fee)
 
-        if cap_iso:
-            cap = date.fromisoformat(cap_iso)
-            if date.fromisoformat(d1) > cap:
-                return {"tin":0.0, "tout":0.0, "saldo":0.0}
-            if date.fromisoformat(d2) > cap:
-                d2 = cap.isoformat()
+            ent = (m_mensal * monthly_fee) + (avu * single_fee) + cards_i + ex_in
+            sai = (rent if eff_ms else 0.0) + ((ref_fee * rnd) if has_ref else 0.0) + ex_out
+            saldo = ent - sai
+            total_in += ent
+            total_out += sai
 
-        rounds_m = int(df_query(
-            "SELECT COUNT(*) AS n FROM rounds WHERE date BETWEEN :a AND :b",
-            {"a": d1, "b": d2}
-        ).iloc[0]["n"] or 0)
+            rows.append([_month_name_pt(m), ent, sai, saldo])
 
-        avulsos_m = int(df_query("""
-            SELECT COUNT(*) AS n
-              FROM player_round pr
-              JOIN rounds r  ON r.id = pr.round_id
-              JOIN players p ON p.id = pr.player_id
-             WHERE pr.presence = 1
-               AND COALESCE(p.plan,'Mensalista') = 'Avulso'
-               AND r.date BETWEEN :a AND :b
-        """, {"a": d1, "b": d2}).iloc[0]["n"] or 0)
+        dfy = pd.DataFrame(rows, columns=["Mês","Entradas","Saídas","Saldo"])
+        # Linha total
+        if not dfy.empty:
+            dfy.loc[len(dfy)] = ["Total", float(total_in), float(total_out), float(total_in-total_out)]
+        return dfy
 
-        cards = df_query("""
-            SELECT
-               COALESCE(SUM(pr.yellow_cards),0) AS ca,
-               COALESCE(SUM(pr.red_cards),0)    AS cv
-              FROM player_round pr
-              JOIN rounds r ON r.id = pr.round_id
-             WHERE r.date BETWEEN :a AND :b
-        """, {"a": d1, "b": d2})
-        ca = int(cards.iloc[0]["ca"] or 0) if not cards.empty else 0
-        cv = int(cards.iloc[0]["cv"] or 0) if not cards.empty else 0
-        cards_income = (ca * yc_fee) + (cv * rc_fee)
-
-        ex = df_query("""
-            SELECT COALESCE(type,'') AS type, COALESCE(value,0) AS value
-              FROM cash_extra
-             WHERE season = :s AND date BETWEEN :a AND :b
-        """, {"s": y, "a": d1, "b": d2})
-        extra_in  = float(ex[ex["type"] == "Entrada"]["value"].sum()) if not ex.empty else 0.0
-        extra_out = float(ex[ex["type"] == "Saída"]["value"].sum())   if not ex.empty else 0.0
-
-        mensalistas_pagantes = _mensalistas_paid_count(season, month) if (not cap_iso or date.fromisoformat(d1) <= date.fromisoformat(cap_iso)) else 0
-
-        entradas_total = (mensalistas_pagantes * monthly_fee) + (avulsos_m * single_fee) + cards_income + extra_in
-        saidas_total   = (rent if (not cap_iso or date.fromisoformat(d1) <= date.fromisoformat(cap_iso)) else 0.0) + ((ref_fee * rounds_m) if has_ref else 0.0) + extra_out
-        return {"tin": float(entradas_total), "tout": float(saidas_total), "saldo": float(entradas_total - saidas_total)}
-
-    rows = []
-    tot_in = tot_out = 0.0
-    for m in range(1, 13):
-        res = _month_summary_capped_year(sel_season, m, last_round_iso)
-        rows.append({
-            "Mês": _month_name_pt(m),
-            "Entradas": res["tin"],
-            "Saídas":   res["tout"],
-            "Saldo":    res["saldo"],
-        })
-        tot_in  += res["tin"]
-        tot_out += res["tout"]
-
-    df_year = pd.DataFrame(rows, columns=["Mês", "Entradas", "Saídas", "Saldo"])
-
-    # linha Total no final (Arrow-friendly)
-    total_row = pd.DataFrame([{
-        "Mês": "Total",
-        "Entradas": float(tot_in),
-        "Saídas":   float(tot_out),
-        "Saldo":    float(tot_in - tot_out)
-    }])
-    df_year["Mês"] = df_year["Mês"].astype(str)
-    for col in ["Entradas", "Saídas", "Saldo"]:
-        df_year[col] = pd.to_numeric(df_year[col], errors="coerce").astype(float)
-    df_year = pd.concat([df_year, total_row.astype(df_year.dtypes)], ignore_index=True)
-
-    st.dataframe(df_year, use_container_width=True, hide_index=True)
+    df_year = _year_summary(sel_season, last_round_dt)
+    if df_year.empty:
+        st.info("Sem dados para o ano selecionado (até a última rodada).")
+    else:
+        # Evitar erro de Arrow com a linha 'Total' (mantemos tudo como texto formatado)
+        df_year_fmt = df_year.copy()
+        for col in ["Entradas","Saídas","Saldo"]:
+            df_year_fmt[col] = df_year_fmt[col].apply(lambda v: f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+        st.dataframe(df_year_fmt, use_container_width=True, hide_index=True, key=f"year_summary_{sel_season}")
